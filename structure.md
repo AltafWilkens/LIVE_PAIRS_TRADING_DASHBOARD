@@ -1,4 +1,4 @@
-jse-pairs-trading/
+LIVE_PAIRS_TRADING_DASHBOARD/
 ├── README.md                 # Full LaTeX math explanation
 ├── requirements.txt          # All Python dependencies
 ├── Dockerfile                # Containerization

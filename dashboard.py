@@ -89,7 +89,11 @@ st.markdown("""
 st.sidebar.title("⚙️ Configuration")
 
 # API Configuration
-api_url = st.sidebar.text_input("FastAPI URL", value="http://localhost:8000")
+#api_url = st.sidebar.text_input("FastAPI URL", value="http://localhost:8000")
+api_url = st.sidebar.text_input(
+    "FastAPI URL",
+    value="https://jse-pairs-api.onrender.com"  # Your deployed API URL
+)
 st.sidebar.markdown("---")
 
 # Pair selection
@@ -312,7 +316,7 @@ if auto_refresh:
 # -------------------- FOOTER --------------------
 st.markdown("""
     <div class="footer">
-        Built with ❤️ by NWU Applied Mathematics Graduate | 
+        Built with ❤️ by Mathematics and Applied Mathematics Graduate | 
         Data from Yahoo Finance | 
         <a href="https://github.com" target="_blank">GitHub</a>
     </div>

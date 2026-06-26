@@ -19,6 +19,9 @@ import logging
 import warnings
 warnings.filterwarnings('ignore')
 
+from services.pair_screener import screen_pairs
+from config.universe import SECTOR_GROUPS, STRUCTURAL_PAIRS
+
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -61,6 +64,22 @@ class SpreadResponse(BaseModel):
     spread_mean: float
     spread_std: float
     data_points: int
+
+class ScreenedPair(BaseModel):
+    ticker1: str
+    ticker2: str
+    sector: str
+    correlation: float
+    adf_pvalue: float
+    is_cointegrated: bool
+    half_life_days: float
+    data_points: int
+
+class ScreenResponse(BaseModel):
+    pairs: list[ScreenedPair]
+    pairs_tested: int
+    pairs_found: int
+    timestamp: datetime
 
 # -------------------- ROBUST DATA FETCHING --------------------
 def fetch_price_series(ticker: str, start_date: str, end_date: str) -> pd.Series:
@@ -246,7 +265,8 @@ def root():
         "message": "JSE Pairs Trading API v2.0",
         "status": "running",
         "endpoints": {
-            "/spread": "POST - Calculate spread and z-score",
+            "/spread": "POST - Calculate spread and z-score for a given pair",
+            "/screen": "GET - Scan the JSE universe for cointegrated pairs",
             "/health": "GET - API health check",
             "/test": "GET - Test data fetching",
             "/test_pair": "POST - Test a specific pair"
@@ -256,6 +276,41 @@ def root():
 @app.get("/health")
 def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+@app.get("/screen", response_model=ScreenResponse)
+def screen_endpoint(lookback_days: int = 504, correlation_threshold: float = 0.7):
+    """
+    Scan the curated JSE ticker universe (config/universe.py) for
+    cointegrated pairs. Runs a correlation pre-filter within each
+    sector group, then Engle-Granger cointegration on the survivors.
+
+    This can take a while on first call since it batch-downloads the
+    full universe from yfinance. Results aren't cached between calls
+    in this version -- re-running re-downloads.
+    """
+    try:
+        results_df = screen_pairs(
+            SECTOR_GROUPS,
+            STRUCTURAL_PAIRS,
+            lookback_days=lookback_days,
+            correlation_threshold=correlation_threshold,
+        )
+
+        # candidate count for context, mirroring screen_pairs' internal logic
+        from services.pair_screener import _candidate_pairs
+        pairs_tested = len(_candidate_pairs(SECTOR_GROUPS, STRUCTURAL_PAIRS))
+
+        pairs = [ScreenedPair(**row) for row in results_df.to_dict(orient="records")]
+
+        return ScreenResponse(
+            pairs=pairs,
+            pairs_tested=pairs_tested,
+            pairs_found=len(pairs),
+            timestamp=datetime.now(),
+        )
+    except Exception as e:
+        logger.error(f"Screening error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/test")
 def test_endpoint():
