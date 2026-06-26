@@ -92,7 +92,7 @@ st.sidebar.title("⚙️ Configuration")
 #api_url = st.sidebar.text_input("FastAPI URL", value="http://localhost:8000")
 api_url = st.sidebar.text_input(
     "FastAPI URL",
-    value="https://jse-pairs-api.onrender.com"  # Your deployed API URL
+    value="https://live-pairs-trading-dashboard.onrender.com"  # Your deployed API URL
 )
 st.sidebar.markdown("---")
 
