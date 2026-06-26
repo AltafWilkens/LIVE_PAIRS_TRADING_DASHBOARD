@@ -139,7 +139,7 @@ def fetch_spread_data(t1, t2, lookback, entry, exit):
             st.error(f"API Error: {response.status_code} - {response.text}")
             return None
     except requests.exceptions.ConnectionError:
-        st.error("❌ Cannot connect to FastAPI. Make sure it's running on port 8000.")
+        st.error("❌ Cannot connect to FastAPI. Make sure it's running on Render.")
         return None
     except Exception as e:
         st.error(f"Error: {str(e)}")
