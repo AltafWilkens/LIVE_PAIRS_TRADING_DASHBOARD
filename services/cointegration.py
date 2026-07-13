@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller, coint
+from statsmodels.tsa.vector_ar.vecm import coint_johansen
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +57,67 @@ def engle_granger_test(df: pd.DataFrame, t1: str, t2: str) -> Dict[str, Any]:
     return {
         "hedge_ratio": float(hedge_ratio),
         "spread": spread,
-        "is_cointegrated": adf_result[1] < 0.05,
+        "is_cointegrated": bool(adf_result[1] < 0.05),
         "adf_pvalue": float(adf_result[1]),
         "adf_statistic": float(adf_result[0]),
+        "spread_mean": float(spread.mean()),
+        "spread_std": float(spread.std()),
+    }
+
+
+def johansen_test(
+    df: pd.DataFrame, t1: str, t2: str, det_order: int = 0, k_ar_diff: int = 1
+) -> Dict[str, Any]:
+    """
+    Run the Johansen trace test for cointegration on a pair of aligned
+    price series, and derive a hedge ratio from the leading cointegrating
+    vector.
+
+    Unlike Engle-Granger (which regresses one series on the other and is
+    therefore direction-dependent), Johansen treats both series
+    symmetrically via a VECM and can in principle detect multiple
+    cointegrating relationships. For a two-asset pair there is at most one,
+    so we use the eigenvector associated with the largest eigenvalue
+    (``evec[:, 0]``) as the cointegrating relationship.
+
+    Parameters
+    ----------
+    df : DataFrame with columns [t1, t2], aligned on a common index.
+    t1, t2 : column names of the two tickers.
+    det_order : deterministic trend order passed to coint_johansen
+        (0 = constant term in the cointegrating relation, the standard
+        choice for price-level pairs trading).
+    k_ar_diff : number of lagged differences in the underlying VECM.
+
+    Returns
+    -------
+    dict shaped like engle_granger_test's output (hedge_ratio, spread,
+    is_cointegrated, spread_mean, spread_std) plus Johansen-specific
+    trace_stat and trace_crit_90_95_99, so callers that only need the
+    common fields (e.g. the backtester) can treat both tests
+    interchangeably.
+    """
+    endog = df[[t1, t2]].to_numpy()
+
+    result = coint_johansen(endog, det_order, k_ar_diff)
+
+    # Leading cointegrating vector (largest eigenvalue) normalized so the
+    # t1 weight is 1: y - hedge_ratio * x is stationary, matching the
+    # engle_granger_test spread convention.
+    evec = result.evec[:, 0]
+    hedge_ratio = -evec[1] / evec[0]
+
+    spread = df[t1] - hedge_ratio * df[t2]
+
+    trace_stat = float(result.lr1[0])
+    trace_crit_90_95_99 = tuple(float(c) for c in result.cvt[0])
+
+    return {
+        "hedge_ratio": float(hedge_ratio),
+        "spread": spread,
+        "is_cointegrated": bool(trace_stat > trace_crit_90_95_99[1]),  # 95% level
+        "trace_stat": trace_stat,
+        "trace_crit_90_95_99": trace_crit_90_95_99,
         "spread_mean": float(spread.mean()),
         "spread_std": float(spread.std()),
     }

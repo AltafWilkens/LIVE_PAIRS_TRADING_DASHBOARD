@@ -4,21 +4,22 @@ NWU Applied Mathematics Quant Project
 Handles ALL yfinance edge cases gracefully
 """
 
-import yfinance as yf
 import pandas as pd
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from pydantic import BaseModel, Field
+from typing import Literal, Optional, Dict, Any
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller
-from datetime import datetime, timedelta
+from datetime import datetime
 import uvicorn
 import logging
 import warnings
 warnings.filterwarnings('ignore')
 
+from services.backtester import BacktestConfig, run_backtest
+from services.data_fetcher import fetch_pair_data, fetch_price_series
 from services.pair_screener import screen_pairs
 from config.universe import SECTOR_GROUPS, STRUCTURAL_PAIRS
 
@@ -81,102 +82,42 @@ class ScreenResponse(BaseModel):
     pairs_found: int
     timestamp: datetime
 
-# -------------------- ROBUST DATA FETCHING --------------------
-def fetch_price_series(ticker: str, start_date: str, end_date: str) -> pd.Series:
-    """
-    Fetch price series for a single ticker with robust error handling.
-    Returns a pandas Series with proper index.
-    """
-    try:
-        logger.info(f"Fetching {ticker} from {start_date} to {end_date}")
+class BacktestRequest(BaseModel):
+    ticker1: str
+    ticker2: str
+    lookback_days: int = Field(default=1500, gt=0)
+    coint_method: Literal["engle_granger", "johansen"] = "engle_granger"
+    entry_zscore: float = Field(default=2.0, gt=0)
+    exit_zscore: float = Field(default=0.5, ge=0)
+    lookback_window: int = Field(default=252, gt=0)
+    reestimate_every: int = Field(default=21, gt=0)
+    zscore_window: int = Field(default=30, gt=0)
+    require_cointegration: bool = True
+    transaction_cost_bps: float = Field(default=5.0, ge=0)
+    slippage_bps: float = Field(default=2.0, ge=0)
+    capital: float = Field(default=100_000.0, gt=0)
 
-        # Download with multiple attempts
-        data = yf.download(
-            ticker,
-            start=start_date,
-            end=end_date,
-            progress=False,
-            auto_adjust=True,
-            threads=False,  # Avoid threading issues
-            prepost=False   # Only trading hours
-        )
+class EquityPoint(BaseModel):
+    date: str
+    equity: float
 
-        # Check if data is empty
-        if data.empty:
-            logger.warning(f"No data returned for {ticker}")
-            return pd.Series(dtype=float)
+class ZScorePoint(BaseModel):
+    date: str
+    zscore: Optional[float] = None
 
-        # Try different column names in order of preference
-        price_col = None
-        for col in ['Adj Close', 'Close', 'adjclose', 'close', 'Price']:
-            if col in data.columns:
-                price_col = col
-                break
+class TradeRecord(BaseModel):
+    entry_date: str
+    exit_date: str
+    direction: int
+    pnl: float
 
-        if price_col is None:
-            # If no standard column, use the first numeric column
-            numeric_cols = data.select_dtypes(include=[np.number]).columns
-            if len(numeric_cols) > 0:
-                price_col = numeric_cols[0]
-                logger.info(f"Using fallback column: {price_col} for {ticker}")
-            else:
-                logger.warning(f"No numeric columns found for {ticker}")
-                return pd.Series(dtype=float)
-
-        # Extract series and ensure it's a Series with proper index
-        series = data[price_col]
-
-        # Ensure it's a Series (not DataFrame)
-        if isinstance(series, pd.DataFrame):
-            series = series.iloc[:, 0]
-
-        # Drop NaN values
-        series = series.dropna()
-
-        logger.info(f"Successfully fetched {len(series)} rows for {ticker}")
-        return series
-
-    except Exception as e:
-        logger.error(f"Error fetching {ticker}: {str(e)}")
-        return pd.Series(dtype=float)
-
-def fetch_pair_data(ticker1: str, ticker2: str, lookback_days: int) -> pd.DataFrame:
-    """
-    Fetch aligned price data for a pair of tickers.
-    """
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=lookback_days)
-
-    # Format dates as strings (yyyy-mm-dd)
-    start_str = start_date.strftime('%Y-%m-%d')
-    end_str = end_date.strftime('%Y-%m-%d')
-
-    # Fetch both series
-    series1 = fetch_price_series(ticker1, start_str, end_str)
-    series2 = fetch_price_series(ticker2, start_str, end_str)
-
-    # Check if we got data
-    if series1.empty:
-        raise ValueError(f"No data available for {ticker1}. Please check the ticker symbol.")
-    if series2.empty:
-        raise ValueError(f"No data available for {ticker2}. Please check the ticker symbol.")
-
-    # Create DataFrame with aligned data
-    df = pd.DataFrame({
-        ticker1: series1,
-        ticker2: series2
-    }).dropna()
-
-    # Ensure we have enough data
-    if len(df) < 20:
-        raise ValueError(
-            f"Insufficient overlapping data: only {len(df)} rows. "
-            f"Check if both tickers are active during this period."
-        )
-
-    logger.info(f"Aligned data: {len(df)} rows from {df.index[0]} to {df.index[-1]}")
-
-    return df
+class BacktestResponse(BaseModel):
+    ticker1: str
+    ticker2: str
+    equity_curve: list[EquityPoint]
+    zscore_series: list[ZScorePoint]
+    trades: list[TradeRecord]
+    metrics: Dict[str, float]
 
 # -------------------- COINTEGRATION AND STATISTICS --------------------
 def calculate_cointegration(df: pd.DataFrame, t1: str, t2: str) -> Dict[str, Any]:
@@ -269,7 +210,8 @@ def root():
             "/screen": "GET - Scan the JSE universe for cointegrated pairs",
             "/health": "GET - API health check",
             "/test": "GET - Test data fetching",
-            "/test_pair": "POST - Test a specific pair"
+            "/test_pair": "POST - Test a specific pair",
+            "/backtest": "POST - Run a walk-forward backtest for a pair",
         }
     }
 
@@ -412,6 +354,64 @@ def calculate_spread_endpoint(request: PairRequest):
         raise
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/backtest", response_model=BacktestResponse)
+def backtest_endpoint(request: BacktestRequest):
+    """
+    Run a walk-forward backtest for a pair: rolling hedge-ratio
+    re-estimation, z-score entry/exit, transaction costs and slippage.
+    Delegates entirely to services.backtester.run_backtest.
+    """
+    try:
+        prices = fetch_pair_data(request.ticker1, request.ticker2, request.lookback_days)
+
+        config = BacktestConfig(
+            entry_zscore=request.entry_zscore,
+            exit_zscore=request.exit_zscore,
+            lookback_window=request.lookback_window,
+            reestimate_every=request.reestimate_every,
+            zscore_window=request.zscore_window,
+            coint_method=request.coint_method,
+            require_cointegration=request.require_cointegration,
+            transaction_cost_bps=request.transaction_cost_bps,
+            slippage_bps=request.slippage_bps,
+            capital=request.capital,
+        )
+
+        result = run_backtest(prices, request.ticker1, request.ticker2, config)
+
+        equity_curve = [
+            EquityPoint(date=idx.isoformat(), equity=float(value))
+            for idx, value in result.equity_curve.items()
+        ]
+        zscore_series = [
+            ZScorePoint(date=idx.isoformat(), zscore=(float(value) if pd.notna(value) else None))
+            for idx, value in result.zscore_series.items()
+        ]
+        trades = [
+            TradeRecord(
+                entry_date=row.entry_date.isoformat(),
+                exit_date=row.exit_date.isoformat(),
+                direction=int(row.direction),
+                pnl=float(row.pnl),
+            )
+            for row in result.trades.itertuples(index=False)
+        ]
+
+        return BacktestResponse(
+            ticker1=request.ticker1,
+            ticker2=request.ticker2,
+            equity_curve=equity_curve,
+            zscore_series=zscore_series,
+            trades=trades,
+            metrics=result.metrics,
+        )
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Backtest error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
